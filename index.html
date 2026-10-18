@@ -1107,10 +1107,63 @@ function tfidfVector(tokens, idf) {
   return vec;
 }
 
-let BM25_INDEX = null;
+// =========================================================
+// MULTI-STRATEGY CHUNK ARRAYS (derived at load time)
+// =========================================================
+function buildAlternativeChunks() {
+  // Simple Fixed-Size: 150-word windows, 100-word step
+  const simple = [];
+  let sIdx = 0;
+  SCRUM_CHUNKS.forEach(c => {
+    const words = c.text.split(/\s+/);
+    const WIN = 150, STEP = 100;
+    if (words.length <= WIN) {
+      simple.push({...c, id:`s${sIdx++}`, text:c.text,
+        embed_text:`${c.source} > ${c.section}: ${c.text}`});
+    } else {
+      for (let i = 0; i < words.length; i += STEP) {
+        const ct = words.slice(i, i + WIN).join(' ');
+        simple.push({...c, id:`s${sIdx++}`, text:ct,
+          embed_text:`${c.source} > ${c.section}: ${ct}`});
+      }
+    }
+  });
+
+  // Fixed Parent-Child: ~60-word children for matching, full parent text shown
+  const parentChild = [];
+  let pIdx = 0;
+  SCRUM_CHUNKS.forEach(c => {
+    const words = c.text.split(/\s+/);
+    const CHILD = 60, STEP = 45;
+    const parentText = c.text;
+    const seen = new Set();
+    for (let i = 0; i < words.length; i += STEP) {
+      const childText = words.slice(i, i + CHILD).join(' ');
+      // de-dup: one entry per 30-word fingerprint
+      const fp = words.slice(i, i + 30).join(' ');
+      if (seen.has(fp)) continue;
+      seen.add(fp);
+      parentChild.push({...c, id:`p${pIdx++}`,
+        text: parentText,   // show full parent in results
+        embed_text:`${c.source} > ${c.section}: ${childText}`}); // match on child
+    }
+  });
+
+  return { simple, parentChild };
+}
+
+const {simple: CHUNKS_SIMPLE, parentChild: CHUNKS_PARENT_CHILD} = buildAlternativeChunks();
+
+function getChunks() {
+  if (activeStrategy === 'fixed')  return CHUNKS_SIMPLE;
+  if (activeStrategy === 'parent') return CHUNKS_PARENT_CHILD;
+  return SCRUM_CHUNKS;
+}
+
+const BM25_INDEXES = {};
 function getIndex() {
-  if (!BM25_INDEX) BM25_INDEX = buildBM25Index(SCRUM_CHUNKS);
-  return BM25_INDEX;
+  if (!BM25_INDEXES[activeStrategy]) BM25_INDEXES[activeStrategy] = buildBM25Index(getChunks());
+  return BM25_INDEXES[activeStrategy];
 }
 
 function retrieve(query, situation, topK) {
@@ -1119,15 +1172,16 @@ function retrieve(query, situation, topK) {
   const queryVec = tfidfVector(queryTokens, idx.idf);
 
   // Filter by situation if set
-  let pool = SCRUM_CHUNKS.map((c, i) => i);
+  const ACTIVE_CHUNKS = getChunks();
+  let pool = ACTIVE_CHUNKS.map((c, i) => i);
   if (situation) {
-    const filtered = pool.filter(i => SCRUM_CHUNKS[i].situation_tags.includes(situation));
-    pool = filtered.length >= topK ? filtered : pool; // fallback to all if too few
+    const filtered = pool.filter(i => ACTIVE_CHUNKS[i].situation_tags.includes(situation));
+    pool = filtered.length >= topK ? filtered : ACTIVE_CHUNKS.map((c,i)=>i); // fallback
   }
 
   // Score: hybrid BM25 + cosine
   const scores = pool.map(i => {
-    const chunk = SCRUM_CHUNKS[i];
+    const chunk = ACTIVE_CHUNKS[i];
     const bm = bm25Score(idx, i, queryTokens);
     const chunkVec = tfidfVector(tokenize(chunk.embed_text), idx.idf);
     const cos = cosineSim(queryVec, chunkVec);
@@ -1169,7 +1223,21 @@ function retrieve(query, situation, topK) {
   // Sort by reranked rank for "after" view
   const topReranked = [...topCos].sort((a, b) => a.rerankedRank - b.rerankedRank);
 
-  return { cosRanked: topCos, reranked: topReranked, all: scores };
+  // For parent-child: deduplicate by parent text (keep highest scoring per parent)
+  let finalCos = topCos, finalReranked = topReranked;
+  if (activeStrategy === 'parent') {
+    const seenText = new Set();
+    finalCos = topCos.filter(s => {
+      const key = s.chunk.id ? s.chunk.id.replace(/^p\d+$/, s.chunk.section) : s.chunk.section;
+      if (seenText.has(key)) return false; seenText.add(key); return true;
+    });
+    const seenText2 = new Set();
+    finalReranked = topReranked.filter(s => {
+      const key = s.chunk.id ? s.chunk.id.replace(/^p\d+$/, s.chunk.section) : s.chunk.section;
+      if (seenText2.has(key)) return false; seenText2.add(key); return true;
+    });
+  }
+  return { cosRanked: finalCos, reranked: finalReranked, all: scores };
 }
 
 function rerankerScore(chunk, queryTokens) {
@@ -1431,6 +1499,8 @@ async function runQuery() {
   sourcesCard.innerHTML = `
     <div class="section-head" onclick="toggleSection('sourcesBody')">
       <h3>Sources</h3>
+      <span style="font-size:0.7rem;padding:2px 7px;border-radius:10px;background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent);font-weight:600;margin-right:4px" id="stratBadge">${{fixed:'Fixed-Size',parent:'Parent-Child',recursive:'Recursive'}[activeStrategy]}</span>
+      <span style="font-size:0.7rem;color:var(--muted);margin-right:6px" id="poolBadge">${getChunks().length} chunks in pool</span>
       <span class="count" id="sourcesCount">${topK}</span>
       <span class="chevron" id="sourcesBody_chev">&#8964;</span>
     </div>
