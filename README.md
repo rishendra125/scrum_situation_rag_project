@@ -2,7 +2,7 @@
 
 A retrieval-augmented generation (RAG) tool for answering Scrum and agile questions grounded strictly in official Scrum.org guides. No hallucination — every answer cites the exact passage it came from.
 
-**Live demo →** [rishendra125.github.io/scrum-situation-rag](https://rishendra125.github.io/scrum-situation-rag)
+**Live demo →** [rishendra125.github.io/scrum_situation_rag_project](https://rishendra125.github.io/scrum_situation_rag_project/)
 
 ![Scrum Situation RAG — working demo](Working%20demo.png)
 
